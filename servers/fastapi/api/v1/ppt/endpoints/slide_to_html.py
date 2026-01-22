@@ -5,7 +5,7 @@ from typing import Optional, List, Dict
 from uuid import UUID
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from openai import APIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
@@ -18,6 +18,56 @@ from .prompts import (
     HTML_EDIT_SYSTEM_PROMPT,
 )
 from models.sql.template import TemplateModel
+from utils.get_env import (
+    get_custom_llm_url_env,
+    get_custom_llm_api_key_env,
+    get_custom_model_env,
+)
+
+
+def _get_gpt5_client(api_key: str):
+    """Get appropriate OpenAI client for GPT-5 features."""
+    # Check if using Azure custom LLM
+    custom_url = get_custom_llm_url_env()
+    if custom_url and "azure" in custom_url.lower():
+        # Use Azure client
+        endpoint = custom_url.rstrip('/')
+        if endpoint.endswith('/v1'):
+            endpoint = endpoint[:-3]
+        if endpoint.endswith('/openai/v1'):
+            endpoint = endpoint[:-10]
+        
+        return AsyncAzureOpenAI(
+            api_key=get_custom_llm_api_key_env() or api_key,
+            azure_endpoint=endpoint,
+            api_version="2024-12-01-preview",
+        )
+    
+    # Use standard OpenAI client
+    return AsyncOpenAI(api_key=api_key)
+
+
+def _get_gpt5_model() -> str:
+    """Get GPT-5 model name from environment or default."""
+    import os
+    
+    # Check for dedicated GPT5_MODEL environment variable first
+    gpt5_model = os.getenv("GPT5_MODEL")
+    if gpt5_model:
+        return gpt5_model
+    
+    custom_model = get_custom_model_env()
+    custom_url = get_custom_llm_url_env()
+    
+    # If using Azure custom LLM and model contains gpt-5, use it
+    if custom_url and "azure" in custom_url.lower() and custom_model:
+        if "gpt-5" in custom_model.lower():
+            return custom_model
+        # Default Azure GPT-5 model for custom templates
+        return "gpt-5-2025-08-07"
+    
+    # Standard OpenAI
+    return "gpt-4o"  # Fallback to gpt-4o for standard OpenAI
 
 
 # Create separate routers for each functionality
@@ -135,7 +185,7 @@ async def generate_html_from_slide(
     fonts: Optional[List[str]] = None,
 ) -> str:
     """
-    Generate HTML content from slide image and XML using OpenAI GPT-5 Responses API.
+    Generate HTML content from slide image and XML using Azure OpenAI Chat Completions API.
 
     Args:
         base64_image: Base64 encoded image data
@@ -151,50 +201,55 @@ async def generate_html_from_slide(
         HTTPException: If API call fails or no content is generated
     """
     print(
-        f"Generating HTML from slide image and XML using OpenAI GPT-5 Responses API..."
+        f"Generating HTML from slide image and XML using Azure OpenAI Chat Completions API..."
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = _get_gpt5_client(api_key)
+        model = _get_gpt5_model()
 
-        # Compose input for Responses API. Include system prompt, image (separate), OXML and optional fonts text.
+        # Compose messages for Chat Completions API
         data_url = f"data:{media_type};base64,{base64_image}"
         fonts_text = (
             f"\nFONTS (Normalized root families used in this slide, use where it is required): {', '.join(fonts)}"
             if fonts
             else ""
         )
-        user_text = f"OXML: \n\n{fonts_text}"
-        input_payload = [
+        user_text = f"OXML: {xml_content}\n{fonts_text}"
+        
+        messages = [
             {"role": "system", "content": GENERATE_HTML_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_image", "image_url": data_url},
-                    {"type": "input_text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text", "text": user_text},
                 ],
             },
         ]
 
-        print("Making Responses API request for HTML generation...")
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "high"},
-            text={"verbosity": "low"},
+        print(f"Making Chat Completions API request with model: {model}")
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=16000,
         )
 
+        # Debug: Print full response structure
+        print(f"API Response: {response}")
+        print(f"Response choices: {response.choices}")
+        if response.choices:
+            print(f"First choice: {response.choices[0]}")
+            print(f"Message: {response.choices[0].message}")
+            print(f"Message content: {response.choices[0].message.content}")
+
         # Extract the response text
-        html_content = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        html_content = response.choices[0].message.content or ""
 
         print(f"Received HTML content length: {len(html_content)}")
 
         if not html_content:
             raise HTTPException(
-                status_code=500, detail="No HTML content generated by OpenAI GPT-5"
+                status_code=500, detail="No HTML content generated by Azure OpenAI"
             )
 
         return html_content
@@ -233,11 +288,13 @@ async def generate_react_component_from_html(
     media_type: Optional[str] = None,
 ) -> str:
     """
-    Convert HTML content to TSX React component using OpenAI GPT-5 Responses API.
+    Convert HTML content to TSX React component using Azure OpenAI Chat Completions API.
 
     Args:
         html_content: Generated HTML content
         api_key: OpenAI API key
+        image_base64: Optional base64 encoded image
+        media_type: Optional MIME type of the image
 
     Returns:
         Generated TSX React component code as string
@@ -246,39 +303,35 @@ async def generate_react_component_from_html(
         HTTPException: If API call fails or no content is generated
     """
     try:
-        client = OpenAI(api_key=api_key)
+        client = _get_gpt5_client(api_key)
+        model = _get_gpt5_model()
 
-        print("Making Responses API request for React component generation...")
+        print(f"Making Chat Completions API request for React component generation with model: {model}...")
 
-        # Build payload with optional image
-        content_parts = [{"type": "input_text", "text": f"HTML INPUT:\n{html_content}"}]
+        # Build messages with optional image
+        content_parts = [{"type": "text", "text": f"HTML INPUT:\n{html_content}"}]
         if image_base64 and media_type:
             data_url = f"data:{media_type};base64,{image_base64}"
-            content_parts.insert(0, {"type": "input_image", "image_url": data_url})
+            content_parts.insert(0, {"type": "image_url", "image_url": {"url": data_url}})
 
-        input_payload = [
+        messages = [
             {"role": "system", "content": HTML_TO_REACT_SYSTEM_PROMPT},
             {"role": "user", "content": content_parts},
         ]
 
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "minimal"},
-            text={"verbosity": "low"},
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=16000,
         )
 
-        react_content = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        react_content = response.choices[0].message.content or ""
 
         print(f"Received React content length: {len(react_content)}")
 
         if not react_content:
             raise HTTPException(
-                status_code=500, detail="No React component generated by OpenAI GPT-5"
+                status_code=500, detail="No React component generated by Azure OpenAI"
             )
 
         react_content = (
@@ -339,7 +392,7 @@ async def edit_html_with_images(
     api_key: str,
 ) -> str:
     """
-    Edit HTML content based on one or two images and a text prompt using OpenAI GPT-5 Responses API.
+    Edit HTML content based on one or two images and a text prompt using Azure OpenAI Chat Completions API.
 
     Args:
         current_ui_base64: Base64 encoded current UI image data
@@ -356,9 +409,10 @@ async def edit_html_with_images(
         HTTPException: If API call fails or no content is generated
     """
     try:
-        client = OpenAI(api_key=api_key)
+        client = _get_gpt5_client(api_key)
+        model = _get_gpt5_model()
 
-        print("Making Responses API request for HTML editing...")
+        print(f"Making Chat Completions API request for HTML editing with model: {model}...")
 
         current_data_url = f"data:{media_type};base64,{current_ui_base64}"
         sketch_data_url = (
@@ -366,42 +420,37 @@ async def edit_html_with_images(
         )
 
         content_parts = [
-            {"type": "input_image", "image_url": current_data_url},
+            {"type": "image_url", "image_url": {"url": current_data_url}},
             {
-                "type": "input_text",
-                "text": f"CURRENT HTML TO EDIT:\n{html_content}\n\nTEXT PROMPT FOR CHANGES:\n{prompt}",
+                "type": "text",
+                "text": f"CURRENT HTML TO EDIT:\\n{html_content}\\n\\nTEXT PROMPT FOR CHANGES:\\n{prompt}",
             },
         ]
         if sketch_data_url:
             # Insert sketch image after current UI image for context
             content_parts.insert(
-                1, {"type": "input_image", "image_url": sketch_data_url}
+                1, {"type": "image_url", "image_url": {"url": sketch_data_url}}
             )
 
-        input_payload = [
+        messages = [
             {"role": "system", "content": HTML_EDIT_SYSTEM_PROMPT},
             {"role": "user", "content": content_parts},
         ]
 
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "low"},
-            text={"verbosity": "low"},
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=16000,
         )
 
-        edited_html = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        edited_html = response.choices[0].message.content or ""
 
         print(f"Received edited HTML content length: {len(edited_html)}")
 
         if not edited_html:
             raise HTTPException(
                 status_code=500,
-                detail="No edited HTML content generated by OpenAI GPT-5",
+                detail="No edited HTML content generated by Azure OpenAI",
             )
 
         return edited_html
