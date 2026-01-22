@@ -3,7 +3,7 @@ import dirtyjson
 import json
 from typing import AsyncGenerator, List, Optional
 from fastapi import HTTPException
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat.chat_completion_chunk import (
     ChatCompletionChunk as OpenAIChatCompletionChunk,
 )
@@ -142,9 +142,30 @@ class LLMClient:
                 status_code=400,
                 detail="Custom LLM URL is not set",
             )
+        
+        base_url = get_custom_llm_url_env()
+        api_key = get_custom_llm_api_key_env() or "null"
+        
+        # Check if this is Azure OpenAI - use native Azure client for legacy API
+        if "azure" in base_url.lower():
+            # Azure OpenAI requires different client and URL format
+            # Extract endpoint (remove /v1 or /openai/v1 suffix if present)
+            endpoint = base_url.rstrip('/')
+            if endpoint.endswith('/v1'):
+                endpoint = endpoint[:-3]
+            if endpoint.endswith('/openai/v1'):
+                endpoint = endpoint[:-10]
+            
+            return AsyncAzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=endpoint,
+                api_version="2024-12-01-preview",
+            )
+        
+        # Standard OpenAI-compatible endpoint
         return AsyncOpenAI(
-            base_url=get_custom_llm_url_env(),
-            api_key=get_custom_llm_api_key_env() or "null",
+            base_url=base_url,
+            api_key=api_key,
         )
 
     # ? Prompts

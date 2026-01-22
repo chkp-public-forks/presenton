@@ -106,8 +106,11 @@ async def check_llm_and_image_provider_api_or_model_availability():
             )
             print("-" * 50)
             print("Available models: ", available_models)
-            if custom_model not in available_models:
+            # Only validate model availability if we successfully retrieved the models list
+            if available_models and custom_model not in available_models:
                 raise Exception(f"Model {custom_model} is not available")
+            elif not available_models:
+                print(f"Skipping model validation - proceeding with configured model: {custom_model}")
 
         # Skip image provider and API key checks if image generation is disabled
         if is_image_generation_disabled():
